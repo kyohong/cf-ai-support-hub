@@ -1,0 +1,486 @@
+import type OpenAI from 'openai'
+import { z } from 'zod'
+import { chatCompletionWithTools } from '@/connectors/llm.connector'
+import type { CompletionResult } from '@/connectors/llm.connector'
+import { errorFields, ORPHAN_LOG } from '@/agent/log'
+import type { TurnLog } from '@/agent/log'
+import { pairedOnly, resultCap } from '@/agent/loop/context-window'
+import { retryOnce } from '@/agent/retry'
+import { BudgetExhausted, type SubrequestBudget } from '@/agent/subrequest-budget'
+import type { ChatMessage, HistoryMessage } from '@/types'
+import {
+  DEFAULT_RESULT_CHARS,
+  recoverableAt,
+  REF_MARKER,
+  toolSpec,
+  truncate,
+  type ToolContext,
+  type ToolDef,
+} from '@/agent/tools/registry'
+
+const EMPTY_REPLY_FALLBACK = '(no answer produced — try rephrasing)'
+
+export const FINAL_ANSWER_RESERVE = 6
+
+const OUT_OF_BUDGET_RESULT = 'error: skipped, request budget exhausted'
+
+const OUT_OF_BUDGET_REPLY =
+  '(stopped early — this turn ran out of its request budget before I could answer. Try again, ideally in smaller steps.)'
+
+// U+FF5C fullwidth pipe: deepseek emits `<｜DSML｜tool_calls>`, which an ASCII-only guard let through.
+const TEXT_TOOL_CALL = /<tool_call>|<arg_key>|<function=|<[|｜]tool▁call|<｜|DSML｜/
+
+function safeText(content: string): string {
+  const trimmed = content.trim()
+  if (!trimmed || trimmed === 'null' || trimmed === 'undefined' || TEXT_TOOL_CALL.test(trimmed)) {
+    return EMPTY_REPLY_FALLBACK
+  }
+  return trimmed
+}
+
+function replyText(r: CompletionResult, model?: string): string {
+  const trimmed = r.content.trim()
+  const leaked = !!trimmed && TEXT_TOOL_CALL.test(trimmed)
+  const text = leaked ? EMPTY_REPLY_FALLBACK : safeText(r.content)
+  // 诊断后缀只给"真空文本"的情况；泄漏场景模型其实出了字，不该误导。
+  const withWhy =
+    !leaked && text === EMPTY_REPLY_FALLBACK && model
+      ? `${text}\n\n(model ${model} returned no text${r.finishReason ? `, finish_reason: ${r.finishReason}` : ''} — try another model)`
+      : text
+  return r.finishReason === 'length' ? `${withWhy}\n\n*(cut off at the output limit)*` : withWhy
+}
+
+function logCompletion(
+  log: TurnLog,
+  stage: string,
+  round: number,
+  model: string,
+  r: CompletionResult,
+  durationMs: number,
+): void {
+  const leaked = r.toolCalls.length === 0 && TEXT_TOOL_CALL.test(r.content)
+  log.event(
+    {
+      at: 'tool-loop',
+      stage,
+      round,
+      model,
+      provider: r.provider,
+      finishReason: r.finishReason,
+      durationMs,
+      ...(r.usage ? { usage: r.usage } : {}),
+      contentLen: r.content.length,
+      toolCalls: r.toolCalls.map((c) => c.function.name),
+      empty: r.content.trim() === '' && r.toolCalls.length === 0,
+      leakedToolCallText: leaked,
+    },
+    leaked || r.finishReason === 'length' ? { sample: r.content.slice(0, 400) } : undefined,
+  )
+}
+
+export type StopReason = 'complete' | 'max-rounds' | 'time-budget' | 'subrequest-budget' | 'no-progress'
+
+export interface ToolLoopInput {
+  log?: TurnLog
+  client: OpenAI
+  model: string
+  systemPrompt: string
+  history: ChatMessage[]
+  tools: ToolDef[]
+  ctx: ToolContext
+  maxRounds?: number
+  budgetMs?: number
+  perToolTimeoutMs?: number
+  subrequests?: SubrequestBudget
+  forceFinalAnswer?: boolean
+  onMessage?: (message: LoopMessage) => void
+  onText?: (text: string) => void
+}
+
+type LoopMessage = Extract<ChatMessage, { role: 'assistant' | 'tool' }>
+
+export interface LoopResult {
+  text: string
+  toolsUsed: string[]
+  stopReason: StopReason
+  roundsUsed: number
+  messages: ChatMessage[]
+  promptTokens?: number
+  tokensSpent: number
+}
+
+export const ARCHIVE_MIN_CHARS = 2000
+
+const PRUNE_HEAD_CHARS = 4096
+const PRUNE_TAIL_CHARS = 1024
+export const PRUNE_OVER_CHARS = 8192
+
+function shorten(content: string): string {
+  const ref = REF_MARKER.exec(content)
+  if (content.length <= PRUNE_OVER_CHARS || !ref) {
+    return content
+  }
+  const cut = content.length - PRUNE_HEAD_CHARS - PRUNE_TAIL_CHARS
+  const gap = `\n…[${cut} characters dropped from this copy — read_tool_result(${ref[1]}) has the whole result]…\n`
+  return content.slice(0, PRUNE_HEAD_CHARS) + gap + content.slice(-PRUNE_TAIL_CHARS)
+}
+
+const PROTECT_RECENT_RESULTS = 1
+
+function pruneToolResults(messages: ChatMessage[], protectFrom: number, round: number, log: TurnLog): void {
+  const recent = new Set(
+    messages
+      .slice(0, protectFrom)
+      .flatMap((m, i) => (m.role === 'tool' ? [i] : []))
+      .slice(-PROTECT_RECENT_RESULTS),
+  )
+  let saved = 0
+  for (let i = 0; i < protectFrom; i++) {
+    const m = messages[i]
+    if (m.role !== 'tool' || recent.has(i)) {
+      continue
+    }
+    const shorter = shorten(m.content)
+    saved += m.content.length - shorter.length
+    m.content = shorter
+  }
+  if (saved > 0) {
+    log.event({ at: 'tool-loop', stage: 'pruned', round, chars: saved })
+  }
+}
+
+export function turnToolTraffic(
+  messages: ChatMessage[],
+  priorHistory: number,
+  now: number,
+  log?: TurnLog,
+): HistoryMessage[] {
+  const written = messages.slice(1 + priorHistory).map((m) => toHistoryMessage(m, now))
+  const paired = pairedOnly(written)
+  if (paired.length !== written.length) {
+    log?.error({ at: 'tool-loop', stage: 'unpaired-write', dropped: written.length - paired.length, priorHistory })
+  }
+  return paired
+}
+
+export function toHistoryMessage(m: ChatMessage, now: number): HistoryMessage {
+  const base = { id: crypto.randomUUID(), at: now }
+  if (m.role === 'tool') {
+    return {
+      ...base,
+      role: 'tool',
+      content: truncate(shorten(m.content), PRUNE_OVER_CHARS),
+      tool_call_id: m.tool_call_id,
+    }
+  }
+  return {
+    ...base,
+    role: 'assistant',
+    content: m.content ?? '',
+    ...('tool_calls' in m && m.tool_calls ? { tool_calls: m.tool_calls } : {}),
+  }
+}
+
+async function fileAndTrim(
+  raw: string,
+  def: ToolDef | undefined,
+  args: string,
+  ctx: ToolContext,
+  log: TurnLog,
+): Promise<string> {
+  const toolCap = def?.maxResultChars ?? DEFAULT_RESULT_CHARS
+  const cap = resultCap(toolCap, ctx.contextTokens)
+  if (raw.length > cap && cap < toolCap) {
+    log.event({ at: 'tool-loop', stage: 'window-capped', tool: def?.name, chars: raw.length, shown: cap })
+  }
+  const trimmed = truncate(raw, cap)
+  const archive = ctx.toolArchive
+  const filing = def && archive && !def.noArchive && raw.length >= ARCHIVE_MIN_CHARS && !raw.startsWith('error:')
+  if (!filing) {
+    return trimmed
+  }
+  let ref: number
+  try {
+    ref = await retryOnce(
+      () => archive.save({ tool: def.name, args, content: raw }),
+      (err) => log.error({ at: 'tool-loop', stage: 'archive-retried', tool: def.name, error: errorFields(err) }),
+    )
+  } catch (err) {
+    log.error({ at: 'tool-loop', stage: 'archive-failed', tool: def.name, chars: raw.length, error: errorFields(err) })
+    return trimmed
+  }
+  const note =
+    raw.length > trimmed.length
+      ? `this copy skips the middle of ${raw.length} characters — read_tool_result(${ref}) reads it from the start`
+      : `read_tool_result(${ref}) returns it again in a later turn, when this copy is gone`
+  return `${trimmed}\n\n${recoverableAt(ref, note)}`
+}
+
+export async function runToolLoop(input: ToolLoopInput): Promise<LoopResult> {
+  const { client, model, tools, ctx, maxRounds = 12, budgetMs = 90_000, perToolTimeoutMs = 10_000 } = input
+  const log = input.log ?? ctx.log ?? ORPHAN_LOG
+  const subrequests = input.subrequests ?? ctx.budget
+  const started = Date.now()
+  const byName = new Map(tools.map((t) => [t.name, t]))
+  const specs = tools.map(toolSpec)
+  const messages: ChatMessage[] = [{ role: 'system', content: input.systemPrompt }, ...input.history]
+  const toolsUsed: string[] = []
+  const releaseReserve = subrequests?.hold(FINAL_ANSWER_RESERVE) ?? (() => {})
+
+  let roundsUsed = 0
+  let stopReason: StopReason | null = null
+  let lastContent = ''
+  let promptTokens: number | undefined
+  let tokensSpent = 0
+  const seenResults = new Set<string>()
+  // 本回合内已失败的工具不允许再次真实执行——重复调用返回与首次完全相同的错误结果，
+  // 让 seenResults 的收敛守卫照常把循环刹住，同时省掉一次注定失败的真实执行。
+  const failedCalls = new Map<string, string>()
+  let sawRepeat = false
+  let outOfBudget = false
+  try {
+    for (let round = 0; round < maxRounds; round++) {
+      if (Date.now() - started > budgetMs) {
+        stopReason = 'time-budget'
+        break
+      }
+      if (subrequests && !subrequests.canAfford(1)) {
+        stopReason = 'subrequest-budget'
+        break
+      }
+      roundsUsed = round + 1
+      const roundStarted = Date.now()
+      let result = await chatCompletionWithTools(client, model, messages, specs, { onText: input.onText })
+      // 免费小模型常见缺陷：带 tools 参数时返回空文本。第一轮就去掉 tools 重发一次纯对话，
+      // 保证所有免费模型都能稳定出字；重试若抛错，真实原因会冒泡到气泡里。
+      if (round === 0 && !result.content.trim() && result.toolCalls.length === 0 && specs.length > 0) {
+        log.event({
+          at: 'tool-loop',
+          stage: 'empty-retry-no-tools',
+          model,
+          finishReason: result.finishReason,
+        })
+        result = await chatCompletionWithTools(client, model, messages, [], { onText: input.onText })
+      }
+      const { content, toolCalls } = result
+      if (round === 0) {
+        promptTokens = result.usage?.inputTokens
+        if (!result.usage) {
+          log.event({ at: 'tool-loop', stage: 'unmetered', model, provider: result.provider })
+        }
+      }
+      tokensSpent += (result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0)
+      lastContent = content || lastContent
+      logCompletion(log, 'round', round, model, result, Date.now() - roundStarted)
+      if (toolCalls.length === 0) {
+        log.event({
+          at: 'tool-loop',
+          stage: 'done',
+          model,
+          roundsUsed,
+          stopReason: 'complete',
+          elapsedMs: Date.now() - started,
+          tokensSpent,
+          toolsUsed,
+        })
+        return {
+          text: replyText(result, model),
+          toolsUsed,
+          stopReason: 'complete',
+          roundsUsed,
+          messages,
+          promptTokens,
+          tokensSpent,
+        }
+      }
+
+      pruneToolResults(messages, messages.length, round, log)
+      const step: LoopMessage = { role: 'assistant', content: content || null, tool_calls: toolCalls }
+      messages.push(step)
+      input.onMessage?.(step)
+      const executed = await Promise.all(
+        toolCalls.map(async (call) => ({
+          call,
+          raw:
+            failedCalls.get(call.function.name) ??
+            (await executeTool(byName, call.function.name, call.function.arguments, ctx, perToolTimeoutMs)),
+        })),
+      )
+      for (const { call, raw } of executed) {
+        toolsUsed.push(call.function.name)
+        if (raw.startsWith('error:')) {
+          failedCalls.set(call.function.name, raw)
+        }
+        if (raw === OUT_OF_BUDGET_RESULT) {
+          stopReason = 'subrequest-budget'
+          outOfBudget = true
+        }
+        const result = await fileAndTrim(raw, byName.get(call.function.name), call.function.arguments, ctx, log)
+        log.event(
+          {
+            at: 'tool-loop',
+            stage: 'tool-result',
+            round,
+            tool: call.function.name,
+            resultLen: result.length,
+            isError: result.startsWith('error:'),
+          },
+          { args: call.function.arguments.slice(0, 200), resultHead: result.slice(0, 160) },
+        )
+        const answered: LoopMessage = { role: 'tool', tool_call_id: call.id, content: result }
+        messages.push(answered)
+        input.onMessage?.(answered)
+
+        if (!outOfBudget) {
+          const key = `${call.function.name}\0${call.function.arguments}\0${result}`
+          if (seenResults.has(key)) {
+            sawRepeat = true
+          }
+          seenResults.add(key)
+        }
+      }
+
+      if (sawRepeat) {
+        stopReason = 'no-progress'
+        log.event({ at: 'tool-loop', stage: 'no-progress', round })
+        break
+      }
+      if (outOfBudget) {
+        break
+      }
+    }
+  } finally {
+    releaseReserve()
+  }
+
+  if (subrequests && !subrequests.canAfford(2)) {
+    const reason = stopReason ?? 'subrequest-budget'
+    log.event({ at: 'tool-loop', stage: 'out-of-subrequests', model, roundsUsed, spent: subrequests.spent, toolsUsed })
+    log.event({
+      at: 'tool-loop',
+      stage: 'done',
+      model,
+      roundsUsed,
+      stopReason: reason,
+      elapsedMs: Date.now() - started,
+      tokensSpent,
+      toolsUsed,
+    })
+    return {
+      text: lastContent.trim() ? safeText(lastContent) : OUT_OF_BUDGET_REPLY,
+      toolsUsed,
+      stopReason: reason,
+      roundsUsed,
+      messages,
+      promptTokens,
+      tokensSpent,
+    }
+  }
+
+  const reasonSoFar = stopReason ?? 'max-rounds'
+  if (input.forceFinalAnswer === false) {
+    log.event({
+      at: 'tool-loop',
+      stage: 'done',
+      model,
+      roundsUsed,
+      stopReason: reasonSoFar,
+      elapsedMs: Date.now() - started,
+      tokensSpent,
+      toolsUsed,
+    })
+    return { text: '', toolsUsed, stopReason: reasonSoFar, roundsUsed, messages, promptTokens, tokensSpent }
+  }
+
+  const finalStarted = Date.now()
+  // 关键修复：强制最终回答必须完全不带 tools 参数（specs 传 []）。此前这里仍带着 tools +
+  // tool_choice:'none'，免费模型见了 tools 参数就返回空文本，工具轮跑完照样吐出空回复。
+  let final: CompletionResult
+  try {
+    final = await chatCompletionWithTools(client, model, messages, [], { onText: input.onText })
+    if (!final.content.trim()) {
+      log.event({ at: 'tool-loop', stage: 'final-empty-retry', model })
+      final = await chatCompletionWithTools(client, model, messages, [], { onText: input.onText })
+    }
+  } catch (err) {
+    // 预算耗尽等情况：把已有材料原样交回，绝不抛出。
+    log.error({ at: 'tool-loop', stage: 'final-call-failed', error: errorFields(err) })
+    return {
+      text: lastContent.trim() ? safeText(lastContent) : '(no answer produced — the final answer call failed)',
+      toolsUsed,
+      stopReason: stopReason ?? 'max-rounds',
+      roundsUsed,
+      messages,
+      promptTokens,
+      tokensSpent,
+    }
+  }
+  logCompletion(log, 'final', roundsUsed, model, final, Date.now() - finalStarted)
+  tokensSpent += (final.usage?.inputTokens ?? 0) + (final.usage?.outputTokens ?? 0)
+  const reason = stopReason ?? 'max-rounds'
+  log.event({
+    at: 'tool-loop',
+    stage: 'done',
+    model,
+    roundsUsed,
+    stopReason: reason,
+    elapsedMs: Date.now() - started,
+    tokensSpent,
+    toolsUsed,
+  })
+  return {
+    text: replyText(final),
+    toolsUsed,
+    stopReason: reason,
+    roundsUsed,
+    messages,
+    promptTokens,
+    tokensSpent,
+  }
+}
+
+async function executeTool(
+  byName: Map<string, ToolDef>,
+  name: string,
+  rawArgs: string,
+  ctx: ToolContext,
+  timeoutMs: number,
+): Promise<string> {
+  const tool = byName.get(name)
+  if (!tool) {
+    return `error: unknown tool ${name}`
+  }
+
+  let raw: unknown
+  try {
+    raw = JSON.parse(rawArgs || '{}')
+  } catch {
+    return 'error: invalid arguments (not valid JSON)'
+  }
+
+  let args: unknown = raw
+  if (!tool.schema) {
+    const parsed = tool.params.safeParse(raw)
+    if (!parsed.success) {
+      return `error: invalid arguments\n${z.prettifyError(parsed.error)}`
+    }
+    args = parsed.data
+  }
+
+  let timer: ReturnType<typeof setTimeout>
+  try {
+    return await Promise.race([
+      tool.handler(args as never, ctx),
+      new Promise<string>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('tool timed out')), tool.timeoutMs ?? timeoutMs)
+      }),
+    ])
+  } catch (err) {
+    if (err instanceof BudgetExhausted) {
+      return OUT_OF_BUDGET_RESULT
+    }
+    return `error: ${err instanceof Error ? err.message : String(err)}`
+  } finally {
+    clearTimeout(timer!)
+  }
+}

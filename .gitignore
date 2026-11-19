@@ -1,0 +1,26 @@
+node_modules/
+package-lock.json
+
+# Personal deployment config — never publish. Copy wrangler.example.jsonc instead.
+wrangler.jsonc
+# wrangler dev and the eval scripts read .env; a stray .dev.vars would silently win over it
+.env
+.env.*
+!.env.example
+.dev.vars*
+.wrangler/
+worker-configuration.d.ts
+.DS_Store
+
+# `pnpm build:web` output; wrangler serves it and builds it on deploy
+public/
+
+# Harness output: the corpus, labels, vectors and judgments. Never published.
+evals/data/
+evals/.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+
+# Working material — plans, notes, and the local-only half of the evals.
+internal/

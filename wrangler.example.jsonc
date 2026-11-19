@@ -1,0 +1,61 @@
+{
+  // Template for local deployment. Copy to `wrangler.jsonc` and fill in your own ids:
+  //   cp wrangler.example.jsonc wrangler.jsonc
+  // `wrangler.jsonc` is gitignored on purpose — it holds account-specific identifiers.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "personal-agent",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  // Build the client before serving assets. `public/` is gitignored build output.
+  "build": { "command": "pnpm build:web" },
+  // Nightly maintenance: one reconcile-and-reflect for the whole vault.
+  "triggers": { "crons": ["0 4 * * *"] },
+  "durable_objects": {
+    "bindings": [
+      { "name": "PERSONAL_AGENT", "class_name": "PersonalAgent" },
+      { "name": "RESEARCH_SCOUT", "class_name": "ResearchScout" },
+      { "name": "MAINTENANCE", "class_name": "MaintenanceAgent" },
+      { "name": "MCP_REGISTRY", "class_name": "McpRegistry" },
+      { "name": "MCP_CLIENT", "class_name": "McpClient" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["PersonalAgent"] },
+    { "tag": "v2", "new_sqlite_classes": ["ResearchScout"] },
+    { "tag": "v3", "new_sqlite_classes": ["MaintenanceAgent"] },
+    { "tag": "v4", "new_sqlite_classes": ["McpRegistry", "McpClient"] }
+  ],
+  // Without `run_worker_first` the asset server answers these with the SPA shell instead of JSON.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/agents/*", "/api/*", "/admin/*", "/dev/*"]
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": { "enabled": true, "head_sampling_rate": 1, "invocation_logs": true }
+  },
+  "ai": { "binding": "AI" },
+  // Create once: npx wrangler r2 bucket create personal-agent-vault
+  "r2_buckets": [{ "binding": "VAULT", "bucket_name": "personal-agent-vault" }],
+  // Create once: npx wrangler d1 create personal-agent-db
+  // then paste the printed id below. Tables are created automatically on first request.
+  "d1_databases": [
+    {
+      "binding": "WIDGET_DB",
+      "database_name": "personal-agent-db",
+      "database_id": "<YOUR_D1_DATABASE_ID>"
+    }
+  ],
+  // Workers AI needs no key when the AI binding is used (the default path).
+  // For a custom OpenAI-compatible endpoint set LLM_BASE_URL here and `npx wrangler secret put LLM_API_KEY`.
+  "vars": {
+    "LLM_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "ENVIRONMENT": "production",
+    "VAULT_AGENT_DIR": "agent",
+    "LOG_CONTENT": "true"
+  }
+}
