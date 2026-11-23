@@ -1,24 +1,33 @@
 import { runWidgetChat } from '@/widget/chat'
+import { accessIdentity } from '@/widget/memories'
 import {
   addKnowledge,
+  addMemory,
+  clearMemories,
   countMessagesSince,
   countMessagesSinceForBot,
   createBot,
   deleteBot,
   deleteKnowledge,
+  deleteMemoryById,
+  deleteMemory,
   ensureWidgetSchema,
   getBot,
+  listBotMemories,
   listBots,
   listConversations,
   listKnowledge,
   listLeads,
-  statsForBots,
-  updateBot,
+  listMemories,
+  statsForBots,  updateBot,
   updateKnowledge,
+  updateMemory,
+  updateMemoryById,
   type BotInput,
   type BotRow,
   type KnowledgeInput,
   type KnowledgeRow,
+  type MemoryScope,
 } from '@/widget/db'
 import type { ConversationRow, LeadRow } from '@/widget/db'
 import type { Env } from '@/types'
@@ -114,6 +123,7 @@ export async function handleWidgetRequest(
         title: bot.widget_title,
         greeting: bot.widget_greeting,
         color: bot.widget_color,
+        memoryEnabled: bot.memory_enabled === 1,
       },
       200,
       origin,
@@ -177,6 +187,70 @@ export async function handleWidgetRequest(
     }
   }
 
+  // ——— The visitor's own saved profile, managed from the widget's memory drawer ———
+  // Same gate as chat (bot enabled + allowed origin) plus the bot's memory_enabled flag; the
+  // visitorId always comes from the caller, exactly as it does for chat.
+  if (url.pathname.startsWith('/api/widget/memories')) {
+    const botId = url.searchParams.get('botId') ?? ''
+    const visitorId = (url.searchParams.get('visitorId') ?? '').trim().slice(0, 64)
+    if (!botId || !visitorId) {
+      return json({ error: 'botId and visitorId are required' }, 400, origin)
+    }
+    const bot = await getBot(env.WIDGET_DB, botId)
+    if (!bot || bot.enabled !== 1) {
+      return json({ error: 'bot unavailable' }, 404, origin)
+    }
+    if (!originAllowed(bot, origin)) {
+      return json({ error: 'origin not allowed' }, 403, origin)
+    }
+    if (bot.memory_enabled !== 1) {
+      return json({ error: 'memory is disabled for this bot' }, 403, origin)
+    }
+    const scope: MemoryScope = { botId: bot.id, ownerType: 'visitor', ownerId: visitorId }
+    const rest = url.pathname.slice('/api/widget/memories'.length).replace(/^\//, '')
+
+    if (request.method === 'GET' && !rest) {
+      return json({ items: await listMemories(env.WIDGET_DB, scope) }, 200, origin)
+    }
+
+    if (request.method === 'POST' && !rest) {
+      const body = (await request.json().catch(() => null)) as { content?: unknown; category?: unknown } | null
+      const content = typeof body?.content === 'string' ? body.content.trim().slice(0, 500) : ''
+      if (!content) {
+        return json({ error: 'content is required' }, 400, origin)
+      }
+      const category =
+        typeof body?.category === 'string' && body.category.trim() ? body.category.trim().slice(0, 40) : 'context'
+      return json({ memory: await addMemory(env.WIDGET_DB, scope, { category, content, sourceSessionId: null }) }, 201, origin)
+    }
+
+    if (request.method === 'DELETE' && rest === 'clear') {
+      return json({ deleted: await clearMemories(env.WIDGET_DB, scope) }, 200, origin)
+    }
+
+    if ((request.method === 'PATCH' || request.method === 'DELETE') && rest) {
+      if (request.method === 'PATCH') {
+        const body = (await request.json().catch(() => null)) as { content?: unknown; category?: unknown } | null
+        const content = typeof body?.content === 'string' ? body.content.trim().slice(0, 500) : undefined
+        const category = typeof body?.category === 'string' ? body.category.trim().slice(0, 40) : undefined
+        if (content === undefined && category === undefined) {
+          return json({ error: 'content or category is required' }, 400, origin)
+        }
+        const memory = await updateMemory(env.WIDGET_DB, scope, rest, { content, category })
+        if (!memory) {
+          return json({ error: 'memory not found' }, 404, origin)
+        }
+        return json({ memory }, 200, origin)
+      }
+      if (!(await deleteMemory(env.WIDGET_DB, scope, rest))) {
+        return json({ error: 'memory not found' }, 404, origin)
+      }
+      return json({ ok: true }, 200, origin)
+    }
+
+    return json({ error: 'not found' }, 404, origin)
+  }
+
   return json({ error: 'not found' }, 404, origin)
 }
 
@@ -214,6 +288,7 @@ async function botPayload(env: Env, bot: BotRow, todayCounts: Record<string, num
   return {
     ...bot,
     enabled: bot.enabled === 1,
+    memory_enabled: bot.memory_enabled === 1,
     todayMessages: todayCounts[bot.id] ?? 0,
     knowledgeCount: kb.length,
   }
@@ -341,6 +416,69 @@ export async function handleAdminBotsApi(request: Request, url: URL, env: Env): 
     const limit = Math.min(Number(url.searchParams.get('limit') ?? 100) || 100, ADMIN_LIST_LIMIT)
     const items: LeadRow[] = await listLeads(db, botId, limit)
     return Response.json({ items })
+  }
+
+  // ——— Dashboard memory manager: the operator inspects and edits any owner's profile ———
+  if (section === 'memories') {
+    if (request.method === 'GET' && !itemId) {
+      return Response.json({ items: await listBotMemories(db, botId) })
+    }
+    if (request.method === 'POST' && !itemId) {
+      const body = (await request.json().catch(() => null)) as {
+        owner_type?: unknown
+        owner_id?: unknown
+        category?: unknown
+        content?: unknown
+      } | null
+      const content = typeof body?.content === 'string' ? body.content.trim().slice(0, 500) : ''
+      if (!content) {
+        return Response.json({ error: 'content is required' }, { status: 400 })
+      }
+      const ownerType = body?.owner_type === 'visitor' ? 'visitor' : 'user'
+      const ownerId =
+        ownerType === 'visitor'
+          ? typeof body?.owner_id === 'string'
+            ? body.owner_id.trim().slice(0, 64)
+            : ''
+          : accessIdentity(request)
+      if (!ownerId) {
+        return Response.json({ error: 'owner_id is required for visitor memories' }, { status: 400 })
+      }
+      const category =
+        typeof body?.category === 'string' && body.category.trim() ? body.category.trim().slice(0, 40) : 'context'
+      const scope: MemoryScope = { botId, ownerType, ownerId }
+      const memory = await addMemory(db, scope, { category, content, sourceSessionId: null })
+      return Response.json({ memory }, { status: 201 })
+    }
+    if (request.method === 'DELETE' && itemId === 'clear') {
+      const ownerType = url.searchParams.get('ownerType') === 'visitor' ? 'visitor' : 'user'
+      const ownerId =
+        ownerType === 'visitor' ? (url.searchParams.get('ownerId') ?? '').trim().slice(0, 64) : accessIdentity(request)
+      if (!ownerId) {
+        return Response.json({ error: 'ownerId is required for visitor memories' }, { status: 400 })
+      }
+      const scope: MemoryScope = { botId, ownerType, ownerId }
+      return Response.json({ deleted: await clearMemories(db, scope) })
+    }
+    if (itemId && itemId !== 'clear') {
+      if (request.method === 'PATCH') {
+        const body = (await request.json().catch(() => null)) as { content?: unknown; category?: unknown } | null
+        const content = typeof body?.content === 'string' ? body.content.trim().slice(0, 500) : undefined
+        const category = typeof body?.category === 'string' ? body.category.trim().slice(0, 40) : undefined
+        if (content === undefined && category === undefined) {
+          return Response.json({ error: 'content or category is required' }, { status: 400 })
+        }
+        const memory = await updateMemoryById(db, botId, itemId, { content, category })
+        if (!memory) {
+          return Response.json({ error: 'memory not found' }, { status: 404 })
+        }
+        return Response.json({ memory })
+      }
+      if (request.method === 'DELETE') {
+        const ok = await deleteMemoryById(db, botId, itemId)
+        return Response.json({ ok }, { status: ok ? 200 : 404 })
+      }
+    }
   }
 
   return Response.json({ error: 'not found' }, { status: 404 })

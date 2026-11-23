@@ -1,6 +1,7 @@
 import { chatCompletionWithTools } from '@/connectors/llm.connector'
 import { clientForRoute, resolveLlmRoute } from '@/agent/advanced-config'
-import { addConversation, addLead, listKnowledge, markLeadNotified, recentConversations, type BotRow, type KnowledgeRow } from '@/widget/db'
+import { addConversation, addLead, listKnowledge, listMemories, markLeadNotified, recentConversations, type BotRow, type KnowledgeRow, type MemoryRow } from '@/widget/db'
+import { extractMemories, renderMemoryBlock, MEMORY_INJECT_LIMIT } from '@/widget/memories'
 import { buildQrCodeMarkdown, convertCurrency, getWorldTime, readWebpageMarkdown } from '@/tools/builtin-free-tools'
 import type { ChatMessage, Env } from '@/types'
 
@@ -8,7 +9,6 @@ const MAX_TOOL_ROUNDS = 3
 const HISTORY_TURNS = 10
 const MAX_KB_CONTEXT = 5
 const FULL_KB_THRESHOLD = 15
-
 const LEAD_TOOL = {
   type: 'function',
   function: {
@@ -147,8 +147,9 @@ export function renderKnowledge(rows: KnowledgeRow[]): string {
     .join('\n\n')
 }
 
-export function buildWidgetSystemPrompt(bot: BotRow, rows: KnowledgeRow[]): string {
+export function buildWidgetSystemPrompt(bot: BotRow, rows: KnowledgeRow[], memories: MemoryRow[] = []): string {
   const soul = bot.soul_prompt.trim()
+  const profile = memories.length ? `\n${renderMemoryBlock(memories)}\n` : ''
   return `${soul || `You are the customer service assistant for ${bot.name}, embedded on the company's website.`}
 
 Operating rules (these override the persona above):
@@ -160,7 +161,7 @@ Operating rules (these override the persona above):
 - If the visitor asks for a price in another currency, call get_exchange_rate for a live rate, then combine it with the knowledge base.
 - If the visitor asks about your opening hours in their timezone, call get_world_time; if they want a contact QR code, call generate_qr_code.
 - You are a public customer-service widget: you have no file, memory, research or MCP tools, and you must not claim to.
-
+${profile}
 [Company Knowledge Base]
 ${renderKnowledge(rows)}`
 }
@@ -206,13 +207,17 @@ export async function runWidgetChat(
   message: string,
 ): Promise<string> {
   const db = env.WIDGET_DB
-  const [rows, history] = await Promise.all([
+  const memoryOn = bot.memory_enabled === 1
+  const [rows, history, memories] = await Promise.all([
     listKnowledge(db, bot.id),
     recentConversations(db, bot.id, visitorId, HISTORY_TURNS),
+    memoryOn
+      ? listMemories(db, { botId: bot.id, ownerType: 'visitor', ownerId: visitorId }, MEMORY_INJECT_LIMIT)
+      : Promise.resolve([] as MemoryRow[]),
   ])
 
   const messages: ChatMessage[] = [
-    { role: 'system', content: buildWidgetSystemPrompt(bot, retrieveKnowledge(rows, message)) },
+    { role: 'system', content: buildWidgetSystemPrompt(bot, retrieveKnowledge(rows, message), memories) },
     ...history.map((h) => ({ role: h.role, content: h.content }) as ChatMessage),
     { role: 'user', content: message },
   ]
@@ -303,5 +308,10 @@ export async function runWidgetChat(
 
   await addConversation(db, { botId: bot.id, visitorId, ip, role: 'user', content: message })
   await addConversation(db, { botId: bot.id, visitorId, ip, role: 'assistant', content: reply })
+
+  // The reply is already decided; the profile update happens off the response path entirely.
+  if (memoryOn) {
+    ctx.waitUntil(extractMemories(env, { botId: bot.id, ownerType: 'visitor', ownerId: visitorId }, message, reply))
+  }
   return reply
 }

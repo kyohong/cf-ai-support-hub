@@ -16,6 +16,7 @@
 - **单 D1 多租户** —— 每个子客服只是同一张 D1 表里的一行，用 `bot_id` 严格逻辑隔离；几十个站点共用一个库，突破 D1 每账号 10 个数据库的限制。
 - **Shadow DOM 挂件** —— 一行 `<script data-bot-id="...">` 即可给 Shopify、WordPress 或手写 HTML 站点挂上有主题色的聊天气泡，零 CSS 冲突。
 - **轻量知识库 RAG** —— FAQ/手册条目按访客消息打分（≤15 条全量注入，否则关键词 Top 5），拼成 `[Company Knowledge Base]` 注入系统提示词。
+- **持久访客记忆（类 ChatGPT）** —— 打开自动记忆后，机器人从每轮对话中提炼持久事实（称呼、偏好、约束）写入按访客隔离的 D1 记忆档案（自动去重、上限 50 条），每轮回复召回最多 30 条作为背景信息；访客可在挂件内的记忆抽屉中查看/编辑/增删，运营者可在后台 Memory 标签页管理本人与所有访客的档案。
 - **一键学习** —— 后台每条访客提问旁都有「转为知识条目」按钮，点击即把问题预填进知识库表单。
 - **自动线索捕获** —— 模型唯一的写工具是 `capture_customer_lead`；联系方式落入 `bot_leads`，并推送到飞书 / Telegram / 任意 JSON Webhook。
 - **零 Key 工具链** —— Jina Reader 网页读取、多级容灾免 Key 搜索（DuckDuckGo → Wikipedia → HackerNews）、Frankfurter 实时汇率、Piston Python 沙箱、QuickChart 图表、Open-Meteo 天气、IANA 时区与二维码；填入可选 Tavily/Brave Key 后搜索质量自动升级。
@@ -110,6 +111,8 @@ curl -s -o /dev/null -w "%{http_code}\n" https://your-agent.your-subdomain.worke
 ```
 
 可选覆盖：`data-title`、`data-greeting`、`data-color`、`data-api`。
+
+**自动记忆**：在「基础与接入」中打开 **Auto-memory** 开关，机器人即开始跨会话记住每位访客的持久事实。访客在聊天窗口头部会看到 Memory 胶囊按钮，点开是记忆抽屉，可查看、编辑、添加、删除机器人保存的一切；后台的 **Memory** 标签页则展示同样的档案（你本人的与每位访客的），支持内联编辑、新增与「Clear all」清空。
 
 ## 🧰 内置免费工具
 

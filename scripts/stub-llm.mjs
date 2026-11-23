@@ -6,6 +6,10 @@
 //   npx wrangler dev --local \
 //     --var LLM_BASE_URL:http://127.0.0.1:8899/v1 --var LLM_API_KEY:stub --var LLM_MODEL:stub-large
 //
+// Persistent-memory e2e (Phase 2): STUB_EXTRACT_JSON is the canned ops JSON the background
+// extraction call receives; a chat turn whose prompt carries the memory block answers with
+// "PROFILE RECALLED — ..." echoing the injected lines. STUB_VERBOSE=1 logs each request.
+//
 // `--var` overrides `.env` (verified 2026-08-17, wrangler 4.107), which is what makes this
 // work without editing the secrets file.
 
@@ -118,6 +122,9 @@ createServer((req, res) => {
   let body = ''
   req.on('data', (c) => (body += c))
   req.on('end', () => {
+    if (process.env.STUB_VERBOSE) {
+      console.log(`[stub] ${req.method} ${req.url} system=${String(JSON.parse(body || '{}').messages?.[0]?.content ?? '').slice(0, 60)}`)
+    }
     res.setHeader('content-type', 'application/json')
     if (req.url?.endsWith('/models')) {
       return res.end(JSON.stringify({ data: MODELS }))
@@ -132,6 +139,30 @@ createServer((req, res) => {
       )
     }
     const request = JSON.parse(body)
+    // Phase 2 persistent memory: the background extraction call is recognized by its system prompt
+    // and answers with a canned ops JSON (STUB_EXTRACT_JSON), so the D1 write can be verified by
+    // hand; a chat turn whose system prompt carries the injected memory block answers with what it
+    // "recalled", making the D1 → prompt path visible in the reply.
+    const system = request.messages?.[0]?.content ?? ''
+    if (system.startsWith('You maintain the long-term memory profile')) {
+      return res.end(
+        JSON.stringify({
+          choices: [{ message: { content: process.env.STUB_EXTRACT_JSON ?? '{"add":[],"update":[],"delete":[]}' } }],
+          usage: { prompt_tokens: 10 },
+        }),
+      )
+    }
+    if (system.includes('[User Profile & Preferences')) {
+      const recalled = (system.match(/- .+/g) ?? []).join('; ')
+      const completion = {
+        choices: [{ message: { content: `PROFILE RECALLED — ${recalled}` } }],
+        usage: { prompt_tokens: 10 },
+      }
+      if (request.stream) {
+        return streamCompletion(res, completion)
+      }
+      return res.end(JSON.stringify(completion))
+    }
     const wanted = process.env.STUB_TOOLS === '1' ? toolTurn(request) : null
     const completion = wanted ?? {
       choices: [{ message: { content: reply(body) } }],

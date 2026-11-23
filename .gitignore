@@ -12,8 +12,9 @@ wrangler.jsonc
 worker-configuration.d.ts
 .DS_Store
 
-# `pnpm build:web` output; wrangler serves it and builds it on deploy
-public/
+# `pnpm build:web` output; wrangler serves it and builds it on deploy.
+# Anchored to the root so it never shadows web/public/widget.js (widget source).
+/public/
 
 # Harness output: the corpus, labels, vectors and judgments. Never published.
 evals/data/

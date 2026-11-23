@@ -22,6 +22,11 @@ Built on top of [Dominik Klesal's `workers-personal-agent`](https://github.com/D
 - **Lightweight RAG per bot** — FAQ/manual entries are scored against the visitor's message
   (`≤15` entries load in full, otherwise top-5 keyword match) and injected as a
   `[Company Knowledge Base]` block.
+- **Persistent user memory (ChatGPT-style)** — when auto-memory is on, the bot extracts durable
+  facts (name, preferences, constraints) from each exchange into a per-visitor D1 profile with
+  dedupe and a 50-memory cap, recalls up to 30 of them in every reply as background context, and
+  both the visitor (in-widget drawer) and the operator (dashboard Memory tab) can view, edit,
+  add or delete entries.
 - **One-click teach** — every visitor question in the dashboard has a "Turn into FAQ" button that
   pre-fills a knowledge entry.
 - **Automatic lead capture** — the model's only write tool is `capture_customer_lead`; captured
@@ -129,6 +134,12 @@ curl -s -o /dev/null -w "%{http_code}\n" https://your-agent.your-subdomain.worke
 ```
 
 Optional overrides: `data-title`, `data-greeting`, `data-color`, `data-api`.
+
+**Auto-memory**: toggle **Auto-memory** on in **Basics & embed** and the bot starts remembering
+durable facts about each visitor across conversations. Visitors see a Memory pill in the chat
+header — a drawer where they can review, edit, add and delete everything the bot has saved about
+them; the dashboard's **Memory** tab shows the same profiles (yours and each visitor's) with
+inline edit, add and "Clear all".
 
 ## 🧰 Built-in free tools
 

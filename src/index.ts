@@ -7,6 +7,7 @@ import { createMemoryStore } from '@/agent/memory/vault-store'
 import { llmConfig } from '@/agent/llm-config'
 import { customRoute, readAdvancedSettings } from '@/agent/advanced-config'
 import { handleAdminBotsApi, handleWidgetRequest } from '@/widget/router'
+import { handleMemoriesApi } from '@/widget/memories'
 import { PRESET_MODELS, readModels } from '@/agent/model-catalogue'
 import type { AgentState, Env, McpResult, ModelRow } from '@/types'
 
@@ -99,6 +100,10 @@ export default {
 
     if (url.pathname.startsWith('/api/admin/bots')) {
       return handleAdminBotsApi(request, url, env)
+    }
+
+    if (url.pathname.startsWith('/api/memories')) {
+      return handleMemoriesApi(request, url, env)
     }
 
     if (request.method === 'GET' && url.pathname === '/api/config') {

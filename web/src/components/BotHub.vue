@@ -18,8 +18,9 @@ import BotBasics from '@/components/bothub/BotBasics.vue'
 import BotKnowledge from '@/components/bothub/BotKnowledge.vue'
 import BotConversations from '@/components/bothub/BotConversations.vue'
 import BotLeads from '@/components/bothub/BotLeads.vue'
+import BotMemory from '@/components/bothub/BotMemory.vue'
 
-type Tab = 'basics' | 'knowledge' | 'conversations' | 'leads'
+type Tab = 'basics' | 'memory' | 'knowledge' | 'conversations' | 'leads'
 
 const open = ref(false)
 const tab = ref<Tab>('basics')
@@ -39,6 +40,7 @@ const selectedModel = computed({
 
 const tabs = computed<Array<{ id: Tab; label: string }>>(() => [
   { id: 'basics', label: t('bothub.tabBasics') },
+  { id: 'memory', label: t('bothub.tabMemory') },
   { id: 'knowledge', label: t('bothub.tabKnowledge') },
   { id: 'conversations', label: t('bothub.tabConversations') },
   { id: 'leads', label: t('bothub.tabLeads') },
@@ -214,6 +216,7 @@ function teach(question: string): void {
           </div>
           <div class="min-h-0 flex-1 overflow-y-auto p-4">
             <BotBasics v-if="tab === 'basics'" :bot="current" @saved="onSaved" @deleted="onDeleted" />
+            <BotMemory v-else-if="tab === 'memory'" :bot-id="current.id" />
             <BotKnowledge v-else-if="tab === 'knowledge'" :bot-id="current.id" :prefill="prefill" />
             <BotConversations
               v-else-if="tab === 'conversations'"

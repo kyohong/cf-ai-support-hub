@@ -84,7 +84,21 @@ async function copy(): Promise<void> {
           {{ form.enabled ? t('bothub.online') : t('bothub.disabled') }}
         </button>
       </label>
+      <label class="grid gap-1">
+        <span class="text-muted-foreground text-xs">{{ t('bothub.autoMemory') }}</span>
+        <button
+          type="button"
+          role="switch"
+          :aria-checked="form.memory_enabled"
+          class="flex h-9 items-center gap-2 rounded-md border px-3 text-sm"
+          @click="form.memory_enabled = !form.memory_enabled"
+        >
+          <span class="size-2 rounded-full" :class="form.memory_enabled ? 'bg-emerald-500' : 'bg-muted-foreground'" />
+          {{ form.memory_enabled ? t('bothub.memoryOn') : t('bothub.memoryOff') }}
+        </button>
+      </label>
     </div>
+    <p class="text-muted-foreground -mt-1 text-xs">{{ t('bothub.autoMemoryHint') }}</p>
 
     <label class="grid gap-1">
       <span class="text-muted-foreground text-xs">{{ t('bothub.soul') }}</span>

@@ -1,0 +1,32 @@
+<!doctype html>
+<!-- Manual-test host for the embedded widget: a third-party page reduced to one line of markup.
+     Open http://localhost:8787/widget-demo.html?botId=<botId> with `pnpm dev` running. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Widget demo</title>
+    <style>
+      body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 640px; margin: 48px auto; padding: 0 16px; color: #18181b; }
+    </style>
+  </head>
+  <body>
+    <h1>Widget demo page</h1>
+    <p>
+      A stand-in for a third-party storefront. The chat widget loads in the bottom-right corner —
+      add <code>?botId=…</code> to this URL to point it at a bot.
+    </p>
+    <script>
+      var botId = new URLSearchParams(location.search).get('botId')
+      if (botId) {
+        var s = document.createElement('script')
+        s.src = '/widget.js'
+        s.setAttribute('data-bot-id', botId)
+        s.defer = true
+        document.body.appendChild(s)
+      } else {
+        document.body.appendChild(document.createTextNode('Add ?botId=… to this URL.'))
+      }
+    </script>
+  </body>
+</html>

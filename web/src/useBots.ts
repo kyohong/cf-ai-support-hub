@@ -11,6 +11,7 @@ export interface Bot {
   widget_title: string
   widget_greeting: string
   widget_color: string
+  memory_enabled: boolean
   created_at: string
   todayMessages?: number
   knowledgeCount?: number
@@ -113,4 +114,36 @@ export const conversationsApi = {
 export const leadsApi = {
   list: (botId: string) =>
     api<{ items: LeadItem[] }>(`/api/admin/bots/${encodeURIComponent(botId)}/leads?limit=200`).then((r) => r.items),
+}
+
+export interface MemoryItem {
+  id: string
+  bot_id: string
+  owner_type: 'user' | 'visitor'
+  owner_id: string
+  category: string
+  content: string
+  updated_at: string
+}
+
+export const memoriesApi = {
+  /** Every active memory on the bot, all owners (owner_type/owner_id on each item). */
+  listAll: (botId: string) =>
+    api<{ items: MemoryItem[] }>(`/api/admin/bots/${encodeURIComponent(botId)}/memories`).then((r) => r.items),
+  add: (botId: string, item: { owner_type: 'user' | 'visitor'; owner_id?: string; category: string; content: string }) =>
+    api<{ memory: MemoryItem }>(`/api/admin/bots/${encodeURIComponent(botId)}/memories`, jsonInit('POST', item)),
+  update: (botId: string, id: string, item: { content?: string; category?: string }) =>
+    api<{ memory: MemoryItem }>(
+      `/api/admin/bots/${encodeURIComponent(botId)}/memories/${encodeURIComponent(id)}`,
+      jsonInit('PATCH', item),
+    ),
+  remove: (botId: string, id: string) =>
+    api(`/api/admin/bots/${encodeURIComponent(botId)}/memories/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  clear: (botId: string, ownerType: 'user' | 'visitor', ownerId?: string) =>
+    api<{ deleted: number }>(
+      `/api/admin/bots/${encodeURIComponent(botId)}/memories/clear?ownerType=${ownerType}${
+        ownerId ? `&ownerId=${encodeURIComponent(ownerId)}` : ''
+      }`,
+      { method: 'DELETE' },
+    ),
 }
