@@ -144,3 +144,75 @@ a rejected alternative in `docs/decisions/`.
 - **When a measurement comes back empty, suspect the measurement first.** An empty result is
   evidence about the query until proven otherwise.
 - **Re-check a document against the principles it states before handing it over.**
+
+---
+
+# 项目交接记忆（继承自 opencode，2026-11-25）
+
+> 由 DeepSeek Harness 从 opencode 历史对话解析写入。详细版：`~/Desktop/opencode-backup/projects/cf-ai-support-hub.md`
+> 注：本文件上半段是上游 `DomWane/workers-personal-agent` 的描述，**只覆盖"个人 Agent"那条线**；
+> 下面这段补的是本仓库真正的主线——**客服中枢与持久记忆**，它们在上半段和 `ARCHITECTURE.md` 里都没有。
+
+## 这个仓库到底是什么
+
+一个 Worker 同时提供三样东西：
+
+1. **个人 Agent**（上半段讲的那条）：WebSocket 聊天、DO 存会话、R2 存 markdown 长期记忆、深度调研、MCP、每日早报。
+2. **多站点客服中枢**：`bots` 是 D1 里的一行，一段 `<script src=".../widget.js" data-bot-id="...">`
+   就能给任意外站挂上 Shadow DOM 聊天气泡，每 bot 独立知识库 RAG、留资 webhook、访客对话记录。
+3. **类 ChatGPT 持久记忆**（2026-11-22 这条 session 的主体）：每个访客/账号一份跨会话档案，
+   自动抽取、去重、上限 50 条，后台与挂件里都能看/改/删。
+
+## 血缘：这是 fork，且有两个下游/兄弟
+
+```
+DomWane/workers-personal-agent (MIT 上游)
+        ↓
+本地 workers-personal-agent（已删除，main=62079d7）
+        ├──→ 本仓库 cf-ai-support-hub（开源线，2026-11-18 用孤儿分支脱敏重发布，main=c4627bf）
+        └──→ omnibot-saas（商业线，同一棵树切 feat/commercial-saas，VPS + SQLite + 多租户）
+```
+
+- **本仓库是孤儿历史**：只有 2 个 commit（`c4627bf` 初始开源 + `fbc1f03` 持久记忆），上游历史被刻意脱敏切断。
+- **与 omnibot-saas 是兄弟不是父子**，共享 `src/agent/*`、`src/connectors/*`、`src/tools/builtin-free-tools.ts`、
+  `web/src/components/{BotHub,bothub/*}`、`web/public/widget.js`、`web/src/widget-client/*`、`evals/`。
+- **`src/widget/{chat,db,router}.ts` 已经分叉**：本仓库 schema 用 `id`/`enabled`，omnibot 用 `bot_id`/`tenant_id`。
+  **两边不能互拷表结构**，要移植就得适配这两处差异。
+- 本仓库走 Cloudflare 免费层（D1 + R2 + Access + Workers AI），omnibot 走 VPS Docker（Node + better-sqlite3）。
+
+## 记忆层实现（本仓库独有，改之前必读）
+
+- DDL：`migrations/0001-user-memories.sql` → `user_memories(id, bot_id, owner_type('user'|'visitor'), owner_id,
+  category, content, source_session_id, is_active, created_at, updated_at)` + 复合索引 `(bot_id, owner_type, owner_id, is_active)`；
+  另有 `bots.memory_enabled INTEGER DEFAULT 1`。
+- API：`src/widget/router.ts:193` 起 `/api/widget/memories`（GET list / POST add / PATCH /:id / DELETE /:id / DELETE /clear）；
+  后台侧 `/api/memories`。
+- **三条记忆读取路径各不相同**：`listMemories`（后台） / `listBotMemories`（挂件） / `renderMemoryBlock`（注入提示词）。
+  改一处务必确认另外两处的语义，历史上就出过"后台看得见、挂件看不见"的偏差。
+- 注入预算 **4000 字符**；抽取走 `ctx.waitUntil`（不阻塞响应）。
+- 前台组件：`web/src/components/BotMemory.vue`（后台）、挂件侧在 `web/src/widget-client/`。
+
+## 已知缺口（按优先级）
+
+1. **`ARCHITECTURE.md` 对客服层/记忆层零覆盖**（2026-11-25 精确复核：`widget` / `user_memories` /
+   `ensureWidgetSchema` / `listBotMemories` / `renderMemoryBlock` 均 **0 次命中**；337 行只讲个人 Agent 那条线）。
+   新接手的人只能靠 README 了解 D1 多租户与记忆，而 D1 读写路径、注入预算、抽取管线恰恰最容易改坏。
+   **建议补一节 "Customer-service hub (D1) + user memories"。**
+2. **`/api/widget/memories` 没有限流**（chat 有 `countMessagesSince`，记忆接口没有），且 visitorId 未校验 UUID 格式。
+3. **记忆只做过本地 `wrangler dev` + stub LLM 验证**，没在真实部署上跑过。
+4. **本地起 `wrangler dev` 的坑**：`ai` binding 强制 remote proxy，需要 `cloudflared`（本机未装）。
+   解法是把 `wrangler.jsonc` 的 `ai` binding 注释掉，用 `scripts/stub-llm.mjs` + `LLM_BASE_URL` 全本地跑。
+   **部署前必须把 AI binding 恢复**（wrangler.jsonc 里留了注释提醒）。
+5. `README.md` 里的 clone URL 还指向上游，应改成本仓库。
+
+## 部署事实
+
+- `wrangler.jsonc` 被 `.gitignore` 忽略（含账号级 id），模板是 `wrangler.example.jsonc`。
+- 本仓库**未确认有线上实例**。`personal-agent.kyohong670.workers.dev` 目前 302 到 Cloudflare Access，
+  但那是上一代（workers-personal-agent）的部署，不能证明本仓库已上线。
+- 后台靠 Cloudflare Access（邮箱）保护，挂件 `/api/widget/*` 需在 Access 里配 Bypass。
+
+## 注意：本仓库是 PUBLIC
+
+GitHub 上 `kyohong/cf-ai-support-hub` 是 **public**（它本来就是开源线）。提交前确认不含密钥、账号 id、
+真实访客数据。`wrangler.jsonc`、`.env`、`.dev.vars` 都已在 gitignore 里。
